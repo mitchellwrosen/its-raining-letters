@@ -5,10 +5,12 @@ version: 0
 executable its-raining-letters
   build-depends:
       base
+    , bytestring
     , containers
     , mwc-random
     , reactive-banana
     , stm
+    , unordered-containers
     , vty
   default-language: Haskell2010
   ghc-options: -Wall -threaded -rtsopts "-with-rtsopts=-N"

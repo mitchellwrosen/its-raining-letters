@@ -136,12 +136,16 @@ moment gen (cw, ch) eKey = mdo
                 Nothing)
           <$> bLetters <@> eChar)
 
-  let eNextLevel :: Event ()
-      eNextLevel =
-        filterJust
-          ((\score -> guard (score > 0 && score `rem` 40 == 0))
-            <$> bScore
-            <@ eCorrectChar)
+  eNextLevel :: Event () <- do
+    bLevelNum :: Behavior Int <-
+      accumB 0 ((+1) <$ eNextLevel)
+    pure
+      (filterJust
+        ((\score lvl -> do
+          guard (score > 0 && score `rem` 40 == 0 && score `div` 40 > lvl))
+          <$> bScore
+          <*> bLevelNum
+          <@ eCorrectChar))
 
   bLevels :: Behavior [ByteString] <- do
     accumB levels (tail <$ eNextLevel)

@@ -1,0 +1,15 @@
+cabal-version: 2.2
+name: its-raining-letters
+version: 0
+
+executable its-raining-letters
+  build-depends:
+      base
+    , containers
+    , mwc-random
+    , reactive-banana
+    , stm
+    , vty
+  default-language: Haskell2010
+  ghc-options: -Wall -threaded -rtsopts "-with-rtsopts=-N"
+  main-is: Main.hs

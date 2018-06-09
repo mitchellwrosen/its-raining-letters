@@ -1,0 +1,1 @@
+-c "cabal new-repl" --restart its-raining-letters.cabal

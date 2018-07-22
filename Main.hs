@@ -1,12 +1,13 @@
 {-# language LambdaCase          #-}
 {-# language OverloadedStrings   #-}
 {-# language PatternSynonyms     #-}
+{-# language RankNTypes          #-}
 {-# language RecursiveDo         #-}
 {-# language ScopedTypeVariables #-}
 
 import Control.Concurrent
 import Control.Concurrent.STM
-import Control.Exception (bracket)
+import Control.Lens (Prism', preview, prism')
 import Control.Monad
 import Data.ByteString (ByteString)
 import Data.Foldable
@@ -15,7 +16,6 @@ import Data.HashMap.Strict (HashMap)
 import Data.Maybe
 import Data.Sequence (Seq, pattern (:|>))
 import Data.Tuple (swap)
-import Graphics.Vty (Image, Key(..), Picture, Vty)
 import Reactive.Banana
 import Reactive.Banana.Frameworks
 import System.Random.MWC
@@ -23,17 +23,14 @@ import System.Random.MWC
 import qualified Data.ByteString.Char8 as Latin1
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.Sequence as Seq
-import qualified Graphics.Vty as Vty
+import qualified Termbox
 
 main :: IO ()
 main =
-  bracket
-    (Vty.mkVty =<< Vty.standardIOConfig)
-    Vty.shutdown
-    main'
+  Termbox.main main'
 
-main' :: Vty -> IO ()
-main' vty = do
+main' :: IO ()
+main' = do
   gen :: GenIO <-
     createSystemRandom
 
@@ -41,46 +38,55 @@ main' vty = do
     newAddHandler
 
   (cw, ch) <-
-    Vty.displayBounds (Vty.outputIface vty)
+    Termbox.size
 
   doneVar :: TMVar () <-
     newEmptyTMVarIO
 
   network :: EventNetwork <-
     compile $ do
-      eKey :: Event Key <-
+      eKey :: Event Termbox.Key <-
         fromAddHandler keyAddHandler
 
-      bPicture :: Behavior (Maybe Picture) <-
+      bPicture :: Behavior (Maybe (IO ())) <-
         moment gen (cw, ch) eKey
 
-      ePicture :: Event (Future (Maybe Picture)) <-
+      ePicture :: Event (Future (Maybe (IO ()))) <-
         changes bPicture
 
-      let handle :: Maybe Picture -> IO ()
-          handle = \case
-            Nothing ->
-              atomically (putTMVar doneVar ())
-            Just picture ->
-              Vty.update vty picture
+      let
+        render :: Maybe (IO ()) -> IO ()
+        render = \case
+          Nothing ->
+            atomically (putTMVar doneVar ())
+          Just picture -> do
+            Termbox.clear mempty mempty
+            picture
+            Termbox.flush
 
-      liftIO . handle =<< valueB bPicture
+      liftIO . render =<< valueB bPicture
 
-      reactimate' ((fmap.fmap) handle ePicture)
+      reactimate' ((fmap.fmap) render ePicture)
 
   actuate network
+
+  eventChan :: TChan Termbox.Event <-
+    newTChanIO
+
+  (void . forkIO . forever) $ do
+    Termbox.poll >>= atomically . writeTChan eventChan
 
   fix $ \loop ->
     join . atomically $
       (do
-        readTChan (Vty._eventChannel (Vty.inputIface vty)) >>= \case
-          Vty.EvKey KEsc _ ->
+        readTChan eventChan >>= \case
+          Termbox.EventKey Termbox.KeyEsc _ ->
             pure (pure ())
-          Vty.EvKey key _ ->
+          Termbox.EventKey key _ ->
             pure $ do
               fireKey key
               loop
-          Vty.EvResize _ _ ->
+          Termbox.EventResize _ _ ->
             pure (pure ())
           _ ->
             pure loop)
@@ -92,18 +98,13 @@ main' vty = do
 moment
   :: GenIO
   -> (Int, Int)
-  -> Event Key
-  -> MomentIO (Behavior (Maybe Picture))
+  -> Event Termbox.Key
+  -> MomentIO (Behavior (Maybe (IO ())))
 moment gen (cw, ch) eKey = mdo
-  let eChar :: Event Char
-      eChar =
-        filterJust
-          ((\case
-            KChar c ->
-              Just c
-            _ ->
-              Nothing)
-          <$> eKey)
+  let
+    eChar :: Event Char
+    eChar =
+      previewE _KeyChar eKey
 
   (eTick, fireTick) <-
     newEvent
@@ -112,29 +113,31 @@ moment gen (cw, ch) eKey = mdo
     fireTick ()
     threadDelay 600000
 
-  let eCorrectChar :: Event Char
-      eCorrectChar =
-        filterJust
-          ((\cs c ->
-            case cs of
-              _ :|> Loc _ _ c' | c == c' ->
-                Just c
-              _ ->
-                Nothing)
-          <$> bLetters <@> eChar)
+  let
+    eCorrectChar :: Event Char
+    eCorrectChar =
+      filterJust
+        ((\cs c ->
+          case cs of
+            _ :|> Loc _ _ c' | c == c' ->
+              Just c
+            _ ->
+              Nothing)
+        <$> bLetters <@> eChar)
 
   -- This would easier to write with better event merging functions
-  let eIncorrectChar :: Event Char
-      eIncorrectChar =
-        filterJust
-          ((\cs c ->
-            case cs of
-              _ :|> Loc _ _ c' -> do
-                guard (c /= c')
-                pure c
-              _ ->
-                Nothing)
-          <$> bLetters <@> eChar)
+  let
+    eIncorrectChar :: Event Char
+    eIncorrectChar =
+      filterJust
+        ((\cs c ->
+          case cs of
+            _ :|> Loc _ _ c' -> do
+              guard (c /= c')
+              pure c
+            _ ->
+              Nothing)
+        <$> bLetters <@> eChar)
 
   eNextLevel :: Event () <- do
     bLevelNum :: Behavior Int <-
@@ -157,44 +160,54 @@ moment gen (cw, ch) eKey = mdo
     accumB 0
       (unions
         [ (+1) <$ eCorrectChar
-        , subtract 1 <$ eIncorrectChar
+        , subtract 2 <$ eIncorrectChar
         ])
 
-  let eLose :: Event ()
-      eLose =
-        filterJust (f <$> bLetters <@ eTick)
-       where
-        f :: Seq (Loc Char) -> Maybe ()
-        f = \case
-          _ :|> Loc _ h _ | h == ch-1 ->
-            pure ()
+  let
+    eLose :: Event ()
+    eLose =
+      filterJust (f <$> bLetters <@ eTick)
+     where
+      f :: Seq (Loc Char) -> Maybe ()
+      f = \case
+        _ :|> Loc _ h _ | h == ch-1 ->
+          pure ()
+        _ ->
+          Nothing
+
+  let
+    eWin :: Event ()
+    eWin =
+      filterJust
+        ((\case
+          [_] ->
+            Just ()
           _ ->
-            Nothing
+            Nothing)
+        <$> bLevels <@ eNextLevel)
 
-  let eWin :: Event ()
-      eWin =
-        filterJust
-          ((\case
-            [_] ->
-              Just ()
-            _ ->
-              Nothing)
-          <$> bLevels <@ eNextLevel)
+  let
+    render :: [Loc Char] -> Int -> IO ()
+    render letters score =
+      mconcat
+        [ for_
+            (zip [0..] ("Score: " ++ show score))
+            (\(i, v) ->
+              Termbox.set i 0 (Termbox.Cell v Termbox.black Termbox.white))
 
-  let render :: [Loc Char] -> Int -> [Image]
-      render letters score =
-        Vty.string Vty.defAttr ("Score: " <> show score) :
-          map
+        , foldMap
             (\(Loc c r v) ->
-              Vty.translate c r
-                (Vty.char Vty.defAttr (qwertyToColemak HashMap.! v)))
+              Termbox.set c r
+                (Termbox.Cell (qwertyToColemak v) mempty mempty))
             letters
+        ]
 
-  let bPicture0 :: Behavior Picture
-      bPicture0 =
-        (\letters score ->
-          Vty.picForLayers (render (toList letters) score))
-        <$> bLetters <*> bScore
+  let
+    bPicture0 :: Behavior (IO ())
+    bPicture0 =
+      (\letters score ->
+        render (toList letters) score)
+      <$> bLetters <*> bScore
 
   switchB (Just <$> bPicture0) (pure Nothing <$ (eLose <> eWin))
 
@@ -319,16 +332,20 @@ levels =
   , "qwertyuiopasdfghjkl;zxcvbnm,./"
   ]
 
-qwertyToColemak :: HashMap Char Char
+qwertyToColemak :: Char -> Char
 qwertyToColemak =
+  (qwertyToColemakMap HashMap.!)
+
+qwertyToColemakMap :: HashMap Char Char
+qwertyToColemakMap =
   HashMap.fromList
     (zip
       "abcdefghijklmnopqrstuvwxyz;,./"
       "abcsftdhuneimky;qprglvwxjzo,./")
 
-colemakToQwerty :: HashMap Char Char
-colemakToQwerty =
-  (HashMap.fromList . map swap . HashMap.toList) qwertyToColemak
+colemakToQwertyMap :: HashMap Char Char
+colemakToQwertyMap =
+  (HashMap.fromList . map swap . HashMap.toList) qwertyToColemakMap
 
 randomChar :: GenIO -> ByteString -> IO Char
 randomChar gen bytes =
@@ -340,3 +357,23 @@ data Loc a
 
 (&>) :: Functor f => f a -> b -> f b
 (&>) = flip (<$)
+
+------------------------------------------------------------------------------
+-- reactive-banana extras
+------------------------------------------------------------------------------
+
+previewE :: Prism' s a -> Event s -> Event a
+previewE l =
+  filterJust . fmap (preview l)
+
+------------------------------------------------------------------------------
+-- termbox extras
+------------------------------------------------------------------------------
+
+_KeyChar :: Prism' Termbox.Key Char
+_KeyChar =
+  prism'
+    Termbox.KeyChar
+    (\case
+      Termbox.KeyChar c -> Just c
+      _ -> Nothing)
